@@ -3,14 +3,16 @@
 # Builds the Kitsas desktop app (.exe) for Windows on a GitHub-hosted runner.
 #
 # CACHING (two layers):
-#   1. Qt SDK        -> install-qt-action cache: true  (already had this)
-#   2. C++ objects   -> sccache compiler cache, stored in the GitHub Actions
-#                       cache. Unchanged .cpp files are served from cache, so
-#                       after the first run a one-file change rebuilds ~one file
-#                       instead of the whole app.
+#   1. Qt SDK      -> install-qt-action cache: true
+#   2. C++ objects -> sccache compiler cache in the GitHub Actions cache.
 #
-# WHY MSVC: the app links QtWebEngine (Chromium), which on Windows only builds
-# with MSVC. WebEngine here is prebuilt from the Qt kit; we only link it.
+# Why the wrapper: qmake uses $(CXX) for BOTH real compiles AND the
+# moc_predefs.h step, which runs "cl -E" (preprocess only). sccache cannot
+# handle -E and errors out (return code 0x2). So QMAKE_CXX/CC point at a small
+# wrapper that routes -E straight to cl and sends everything else to sccache.
+#
+# Why MSVC: the app links QtWebEngine (Chromium), which on Windows only builds
+# with MSVC. WebEngine is prebuilt from the Qt kit; we only link it.
 
 name: Windows build
 
@@ -20,7 +22,6 @@ on:
   workflow_dispatch: {}
 
 env:
-  # Tell sccache to use the GitHub Actions cache as its backend.
   SCCACHE_GHA_ENABLED: "true"
 
 jobs:
@@ -46,9 +47,36 @@ jobs:
         with:
           arch: x64
 
-      # Installs sccache and points it at the GitHub Actions cache backend.
       - name: Set up sccache
         uses: mozilla-actions/sccache-action@v0.0.6
+
+      # Compiler wrapper. Built line-by-line (no here-string indentation), each
+      # line written flush-left with CRLF so the .bat is valid. It scans the
+      # args token-by-token: if it sees -E / /E (the moc_predefs preprocess
+      # step) it calls plain cl; otherwise it routes through sccache. Scanning
+      # per-token (not a whole-string match) means quoted paths and the "(x86)"
+      # in the Windows SDK include dirs can't break detection.
+      - name: Create sccache compiler wrapper
+        shell: pwsh
+        run: |
+          $lines = @(
+            '@echo off',
+            ':scan',
+            'if "%~1"=="" goto compile',
+            'if /I "%~1"=="-E" goto raw',
+            'if /I "%~1"=="/E" goto raw',
+            'shift',
+            'goto scan',
+            ':compile',
+            'sccache cl %*',
+            'exit /b %errorlevel%',
+            ':raw',
+            'cl %*',
+            'exit /b %errorlevel%'
+          )
+          Set-Content -Path "$env:GITHUB_WORKSPACE\cl-cache.bat" -Value $lines -Encoding Ascii
+          Write-Host "---- cl-cache.bat ----"
+          Get-Content "$env:GITHUB_WORKSPACE\cl-cache.bat"
 
       - name: Remove unused openjpeg link
         shell: bash
@@ -57,17 +85,15 @@ jobs:
       - name: Build
         shell: pwsh
         run: |
+          $wrapper = "$env:GITHUB_WORKSPACE\cl-cache.bat"
           mkdir build
           cd build
-          # Route every compile through sccache. CONFIG+=release keeps MSVC from
-          # emitting a separate .pdb (/Zi), which is what would otherwise defeat
-          # object caching.
-          qmake ..\kitsas\kitsas.pro "CONFIG+=release" `
-                QMAKE_CXX="sccache cl" QMAKE_CC="sccache cl"
+          qmake ..\kitsas\kitsas.pro "CONFIG+=release" "QMAKE_CXX=$wrapper" "QMAKE_CC=$wrapper"
+          Write-Host "---- CXX line in generated Makefile ----"
+          Select-String -Path Makefile.Release -Pattern '^CXX' | Select-Object -First 1
           nmake
           if (!(Test-Path release\kitsas.exe)) { throw "kitsas.exe was not produced" }
 
-      # Cache-hit rate for this run - watch "Cache hits" climb on repeat builds.
       - name: sccache stats
         shell: pwsh
         run: sccache --show-stats
