@@ -203,3 +203,11 @@ CREATE TABLE Vakioviite
 	paattyen DATE,
 	json TEXT
 );
+
+CREATE TABLE Huoneisto
+(
+	id INTEGER PRIMARY KEY,
+	asiakas INTEGER REFERENCES Kumppani(id) ON DELETE SET NULL,
+	nimi TEXT,
+	json TEXT
+);

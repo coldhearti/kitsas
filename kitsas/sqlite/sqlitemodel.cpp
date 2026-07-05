@@ -52,6 +52,7 @@
 #include "routes/tuontitulkki.h"
 #include "routes/inforoute.h"
 #include "routes/vakioviiteroute.h"
+#include "routes/huoneistoroute.h"
 
 #include "versio.h"
 
@@ -83,6 +84,7 @@ SQLiteModel::SQLiteModel(QObject *parent)
     lisaaRoute(new TuontiTulkki(this));
     lisaaRoute(new AlvRoute(this));
     lisaaRoute(new VakioviiteRoute(this));
+    lisaaRoute(new HuoneistoRoute(this));
     lisaaRoute(new InfoRoute(this));
 }
 
@@ -229,6 +231,11 @@ bool SQLiteModel::avaaTiedosto(const QString &polku, bool ilmoitavirheestaAvatta
                 return false;
             }
             kp()->odotusKursori(false);
+            // Fork: huoneisto (apartment) tracking table
+            if( versio < 25 )
+                query.exec("CREATE TABLE Huoneisto ( id INTEGER PRIMARY KEY, "
+                        "asiakas INTEGER REFERENCES Kumppani(id) ON DELETE SET NULL, "
+                        "nimi TEXT, json TEXT )");
             // #603 IBAN siirretään omaan tietokantakenttään, jotta säilyy päivitysten ylitse
             if( versio < 24) {
                 query.exec("ALTER TABLE Tili ADD COLUMN iban VARCHAR(32)");

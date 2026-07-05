@@ -72,7 +72,7 @@ LaskuSivu::~LaskuSivu()
 
 void LaskuSivu::siirrySivulle()
 {
-    paaTab_->setTabEnabled( HUONEISTOT, qobject_cast<PilviModel*>(kp()->yhteysModel()) );
+    paaTab_->setTabEnabled( HUONEISTOT, true );  // fork: enabled on local SQLite too
 
     paaTab( paaTab_->currentIndex() );
 }
