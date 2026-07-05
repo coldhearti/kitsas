@@ -2,22 +2,26 @@
 #
 # Builds the Kitsas desktop app (.exe) for Windows on a GitHub-hosted runner.
 #
+# CACHING (two layers):
+#   1. Qt SDK        -> install-qt-action cache: true  (already had this)
+#   2. C++ objects   -> sccache compiler cache, stored in the GitHub Actions
+#                       cache. Unchanged .cpp files are served from cache, so
+#                       after the first run a one-file change rebuilds ~one file
+#                       instead of the whole app.
+#
 # WHY MSVC: the app links QtWebEngine (Chromium), which on Windows only builds
-# with MSVC — never MinGW. So this uses the Qt "win64_msvc2022_64" kit and the
-# Visual Studio toolchain that ships on the windows-latest runner.
-#
-# The Qt WebEngine module here is PREBUILT (from the official Qt kit); we only
-# link it, we don't compile Chromium — so the build is normal-speed, not hours.
-#
-# Output: a zipped, self-contained "kitsas-windows" folder (exe + all Qt DLLs
-# + QtWebEngineProcess + resources), downloadable from the run's Artifacts.
+# with MSVC. WebEngine here is prebuilt from the Qt kit; we only link it.
 
 name: Windows build
 
 on:
   push:
     branches: [ master, "feature/**" ]
-  workflow_dispatch: {}   # lets you trigger a build manually from the Actions tab
+  workflow_dispatch: {}
+
+env:
+  # Tell sccache to use the GitHub Actions cache as its backend.
+  SCCACHE_GHA_ENABLED: "true"
 
 jobs:
   build:
@@ -27,10 +31,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Installs Qt 6.9.3 for MSVC with the add-on modules Kitsas needs.
-      # Base install already provides qtbase (widgets/sql/network/printsupport/
-      # xml), qtsvg and qtdeclarative(Quick, a WebEngine dep). The -modules are
-      # the extras: WebEngine + its positioning/webchannel deps, PDF, 5Compat.
       - name: Install Qt
         uses: jurplel/install-qt-action@v4
         with:
@@ -41,15 +41,15 @@ jobs:
           modules: 'qtwebengine qtpositioning qtwebchannel qtpdf qt5compat'
           cache: true
 
-      # Puts cl.exe / nmake and the MSVC environment on PATH for later steps.
       - name: Set up MSVC
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
 
-      # openjpeg is referenced only in kitsas.pro's windows{} LIBS and nowhere
-      # in the code (leftover from the old poppler PDF path). Drop the 3 lines
-      # so the linker doesn't demand a lib we don't use. Leaves -lbcrypt intact.
+      # Installs sccache and points it at the GitHub Actions cache backend.
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.6
+
       - name: Remove unused openjpeg link
         shell: bash
         run: sed -i '/openjpeg-v2.5.0-windows-x64/d' kitsas/kitsas.pro
@@ -59,12 +59,19 @@ jobs:
         run: |
           mkdir build
           cd build
-          qmake ..\kitsas\kitsas.pro "CONFIG+=release"
+          # Route every compile through sccache. CONFIG+=release keeps MSVC from
+          # emitting a separate .pdb (/Zi), which is what would otherwise defeat
+          # object caching.
+          qmake ..\kitsas\kitsas.pro "CONFIG+=release" `
+                QMAKE_CXX="sccache cl" QMAKE_CC="sccache cl"
           nmake
           if (!(Test-Path release\kitsas.exe)) { throw "kitsas.exe was not produced" }
 
-      # windeployqt copies every Qt DLL the exe needs, plus the WebEngine
-      # runtime (QtWebEngineProcess.exe + resources + locales), into dist\.
+      # Cache-hit rate for this run - watch "Cache hits" climb on repeat builds.
+      - name: sccache stats
+        shell: pwsh
+        run: sccache --show-stats
+
       - name: Bundle Qt runtime
         shell: pwsh
         run: |
