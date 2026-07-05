@@ -4,12 +4,17 @@
 #
 # CACHING (two layers):
 #   1. Qt SDK      -> install-qt-action cache: true
-#   2. C++ objects -> sccache compiler cache in the GitHub Actions cache.
+#   2. C++ objects -> sccache writing to a LOCAL directory (SCCACHE_DIR),
+#                     persisted across runs by actions/cache@v4.
+#
+# Why not SCCACHE_GHA_ENABLED: that path uses GitHub's legacy cache API
+# (artifactcache.actions.githubusercontent.com), which now returns HTTP 400.
+# actions/cache@v4 uses the current cache service, so we let it persist a plain
+# sccache disk cache instead.
 #
 # Why the wrapper: qmake uses $(CXX) for BOTH real compiles AND the
 # moc_predefs.h step, which runs "cl -E" (preprocess only). sccache cannot
-# handle -E and errors out (return code 0x2). So QMAKE_CXX/CC point at a small
-# wrapper that routes -E straight to cl and sends everything else to sccache.
+# handle -E. cl-cache.bat routes -E to plain cl and everything else to sccache.
 #
 # Why MSVC: the app links QtWebEngine (Chromium), which on Windows only builds
 # with MSVC. WebEngine is prebuilt from the Qt kit; we only link it.
@@ -21,12 +26,13 @@ on:
     branches: [ master, "feature/**" ]
   workflow_dispatch: {}
 
-env:
-  SCCACHE_GHA_ENABLED: "true"
-
 jobs:
   build:
     runs-on: windows-latest
+
+    env:
+      SCCACHE_DIR: ${{ github.workspace }}\.sccache
+      SCCACHE_CACHE_SIZE: 2G
 
     steps:
       - name: Checkout
@@ -47,15 +53,21 @@ jobs:
         with:
           arch: x64
 
-      - name: Set up sccache
+      - name: Install sccache binary
         uses: mozilla-actions/sccache-action@v0.0.6
 
-      # Compiler wrapper. Built line-by-line (no here-string indentation), each
-      # line written flush-left with CRLF so the .bat is valid. It scans the
-      # args token-by-token: if it sees -E / /E (the moc_predefs preprocess
-      # step) it calls plain cl; otherwise it routes through sccache. Scanning
-      # per-token (not a whole-string match) means quoted paths and the "(x86)"
-      # in the Windows SDK include dirs can't break detection.
+      # Persist sccache's on-disk cache with the CURRENT cache API. New sha each
+      # push misses the exact key but restores the newest matching prefix, then
+      # saves a fresh entry at job end.
+      - name: Cache compiled objects
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}\.sccache
+          key: sccache-${{ runner.os }}-${{ github.ref_name }}-${{ github.sha }}
+          restore-keys: |
+            sccache-${{ runner.os }}-${{ github.ref_name }}-
+            sccache-${{ runner.os }}-
+
       - name: Create sccache compiler wrapper
         shell: pwsh
         run: |
