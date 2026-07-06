@@ -46,6 +46,13 @@ void HuoneistoRoute::taytaSaldot(QVariantMap &map, int huoneistoId)
         map.insert("laskutettu", QString::number(laskutettu, 'f', 2));
         map.insert("maksettu",   QString::number(maksettu, 'f', 2));
     }
+
+    // Avoin saldo, laskennallinen eräpäivä ja erääntynyt osuus (jaettu logiikka).
+    const EranTila t = eranTila( eraId(huoneistoId), QDate::currentDate() );
+    map.insert("avoin", t.avoinSnt / 100.0);
+    map.insert("eraantynyt", t.eraantynytSnt / 100.0);
+    if( t.erapvm.isValid() )
+        map.insert("erapvm", t.erapvm);
 }
 
 QVariant HuoneistoRoute::get(const QString &polku, const QUrlQuery &/*urlquery*/)

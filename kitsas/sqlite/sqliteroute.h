@@ -22,6 +22,7 @@
 
 #include <QSqlDatabase>
 #include <QSqlQuery>
+#include <QDate>
 
 #include <exception>
 
@@ -49,6 +50,18 @@ protected:
     static QByteArray mapToJson(const QVariantMap& map);
 
     void taydennaEratJaMerkkaukset(QVariantList& vientilista);
+
+    // Erän avoin saldo, laskennallinen eräpäivä ja erääntynyt osuus.
+    // Toimii sekä tavallisille (positiivisille) erille (otsikkolaskun eräpäivä)
+    // että synteettisille negatiivisille erille (huoneisto/asiakas), joilla
+    // eräpäivä johdetaan aikaisimmasta maksamattomasta kuukausierästä.
+    struct EranTila {
+        qlonglong avoinSnt = 0;       // debet - kredit (sentteinä)
+        qlonglong eraantynytSnt = 0;  // erääntynyt osuus (>= 0)
+        QDate erapvm;                 // laskennallinen eräpäivä
+        bool loytyi = false;          // erällä on rivejä
+    };
+    EranTila eranTila(int eraid, const QDate& tanaan);
 
 protected:
     QSqlDatabase db();

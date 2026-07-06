@@ -203,3 +203,62 @@ void SQLiteRoute::taydennaEratJaMerkkaukset(QVariantList &vientilista)
         }        
     }
 }
+
+SQLiteRoute::EranTila SQLiteRoute::eranTila(int eraid, const QDate &tanaan)
+{
+    EranTila t;
+    QSqlQuery kysely( db() );
+
+    // Avoin saldo (debet - kredit) koko erälle
+    kysely.exec(QString("SELECT COALESCE(SUM(debetsnt),0), COALESCE(SUM(kreditsnt),0) "
+                        "FROM Vienti JOIN Tosite ON Vienti.tosite=Tosite.id "
+                        "WHERE Vienti.eraid=%1 AND Tosite.tila >= 100").arg(eraid));
+    if( kysely.next() ) {
+        t.avoinSnt = kysely.value(0).toLongLong() - kysely.value(1).toLongLong();
+        t.loytyi = true;
+    }
+
+    // Tavallisella erällä on avaava vienti (id == eraid), jonka tositteen
+    // erapvm on laskun eräpäivä.
+    QDate otsikkoErapvm;
+    kysely.exec(QString("SELECT Tosite.erapvm FROM Vienti JOIN Tosite ON Vienti.tosite=Tosite.id "
+                        "WHERE Vienti.id=%1").arg(eraid));
+    if( kysely.next() && kysely.value(0).toDate().isValid() )
+        otsikkoErapvm = kysely.value(0).toDate();
+
+    if( otsikkoErapvm.isValid() ) {
+        // Tavallinen erä: eräpäivä otsikolta, koko avoin erääntynyt jos ohi.
+        t.erapvm = otsikkoErapvm;
+        if( otsikkoErapvm < tanaan && t.avoinSnt > 0 )
+            t.eraantynytSnt = t.avoinSnt;
+    } else {
+        // Synteettinen / kuukausittainen erä ilman otsikkoeräpäivää:
+        // laskennallinen eräpäivä = aikaisin maksamaton kuukausierä,
+        // erääntynyt = jo erääntyneet veloitukset - maksut.
+        qlonglong maksettu = 0;
+        kysely.exec(QString("SELECT COALESCE(SUM(kreditsnt),0) FROM Vienti JOIN Tosite ON Vienti.tosite=Tosite.id "
+                            "WHERE Vienti.eraid=%1 AND Tosite.tila >= 100").arg(eraid));
+        if( kysely.next() )
+            maksettu = kysely.value(0).toLongLong();
+
+        kysely.exec(QString("SELECT Vienti.pvm, COALESCE(Vienti.debetsnt,0) "
+                            "FROM Vienti JOIN Tosite ON Vienti.tosite=Tosite.id "
+                            "WHERE Vienti.eraid=%1 AND Vienti.debetsnt IS NOT NULL AND Tosite.tila >= 100 "
+                            "ORDER BY Vienti.pvm, Vienti.id").arg(eraid));
+        qlonglong kertyma = 0;
+        qlonglong eraantynytVeloitus = 0;
+        while( kysely.next() ) {
+            const QDate pvm = kysely.value(0).toDate();
+            const qlonglong deb = kysely.value(1).toLongLong();
+            kertyma += deb;
+            if( !t.erapvm.isValid() && kertyma > maksettu )
+                t.erapvm = pvm;                       // aikaisin maksamaton erä
+            if( pvm < tanaan )
+                eraantynytVeloitus += deb;            // jo erääntyneet veloitukset
+        }
+        const qlonglong eraantynyt = eraantynytVeloitus - maksettu;
+        t.eraantynytSnt = eraantynyt > 0 ? eraantynyt : 0;
+    }
+
+    return t;
+}

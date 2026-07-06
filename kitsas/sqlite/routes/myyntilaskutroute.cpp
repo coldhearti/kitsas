@@ -18,6 +18,7 @@
 
 #include "model/tositevienti.h"
 #include "model/tosite.h"
+#include "model/euro.h"
 
 #include <QJsonDocument>
 #include <QDate>
@@ -125,6 +126,84 @@ QVariant MyyntilaskutRoute::get(const QString &/*polku*/, const QUrlQuery &urlqu
         }
     }
 
+    // Synteettiset negatiiviset erät (huoneisto/asiakas): yksi rivi per lasku,
+    // avoin ja laskennallinen eräpäivä johdetaan erän riveiltä (jaettu logiikka).
+    // Näin kuukausittainen huoneistolasku näkyy avoimissa/erääntyneissä samoin
+    // kuin pilvipalvelussa, vaikka otsikon erapvm on tyhjä.
+    if( !urlquery.hasQueryItem("luonnos") && !urlquery.hasQueryItem("lahetettava")
+        && urlquery.queryItemValue("avoin") != "maksut" ) {
+
+        const bool avoinTab = urlquery.hasQueryItem("avoin");
+        const bool eraantynytTab = urlquery.hasQueryItem("eraantynyt");
+        QDate tanaan = QDate::currentDate();
+        if( urlquery.hasQueryItem("eraloppupvm") )
+            tanaan = QDate::fromString(urlquery.queryItemValue("eraloppupvm"), Qt::ISODate);
+
+        QString synteesi = QString(
+            "SELECT DISTINCT tosite.id AS tosite, tosite.laskupvm, tosite.viite, tosite.json, "
+            "kumppani.nimi AS asiakas, kumppani.id AS asiakasid, tosite.tyyppi, tosite.tunniste, "
+            "tosite.sarja, tosite.tila, tosite.pvm AS tositepvm, vienti.eraid, vienti.tili "
+            "FROM tosite JOIN Vienti ON vienti.tosite=tosite.id "
+            "LEFT OUTER JOIN Kumppani ON vienti.kumppani=kumppani.id "
+            "WHERE vienti.tyyppi=%1 AND vienti.eraid < 0 AND tosite.tila >= %2 ")
+            .arg( TositeVienti::MYYNTI + TositeVienti::VASTAKIRJAUS )
+            .arg( Tosite::KIRJANPIDOSSA );
+        if( urlquery.hasQueryItem("alkupvm") )
+            synteesi.append(QString(" AND tosite.laskupvm >= '%1' ").arg(urlquery.queryItemValue("alkupvm")));
+        if( urlquery.hasQueryItem("loppupvm") )
+            synteesi.append(QString(" AND tosite.laskupvm <= '%1' ").arg(urlquery.queryItemValue("loppupvm")));
+
+        QSqlQuery synk( db() );
+        synk.exec(synteesi);
+        while( synk.next() ) {
+            const int eraid = synk.value("eraid").toInt();
+            const EranTila t = eranTila( eraid, tanaan );
+
+            if( eraantynytTab ) {
+                if( !t.erapvm.isValid() || t.erapvm >= tanaan || t.avoinSnt <= 0 )
+                    continue;
+            } else if( avoinTab ) {
+                if( t.avoinSnt == 0 )
+                    continue;
+            }
+
+            // Laskun kokonaissumma = tämän laskun saatavaveloitukset
+            qlonglong summaSnt = 0;
+            QSqlQuery sq( db() );
+            sq.exec(QString("SELECT COALESCE(SUM(debetsnt),0) FROM Vienti WHERE tosite=%1 AND tyyppi=%2")
+                    .arg(synk.value("tosite").toInt())
+                    .arg(TositeVienti::MYYNTI + TositeVienti::VASTAKIRJAUS));
+            if( sq.next() ) summaSnt = sq.value(0).toLongLong();
+
+            const QVariantMap lasku = QJsonDocument::fromJson( synk.value("json").toByteArray() )
+                                        .toVariant().toMap().value("lasku").toMap();
+
+            QVariantMap ulos;
+            ulos.insert("tosite", synk.value("tosite"));
+            ulos.insert("pvm", synk.value("laskupvm").toDate());
+            if( t.erapvm.isValid() )
+                ulos.insert("erapvm", t.erapvm);
+            ulos.insert("viite", synk.value("viite"));
+            ulos.insert("summa", Euro(summaSnt).toString());
+            ulos.insert("avoin", Euro(t.avoinSnt).toString());
+            ulos.insert("asiakas", synk.value("asiakas"));
+            ulos.insert("asiakasid", synk.value("asiakasid"));
+            ulos.insert("eraid", eraid);
+            ulos.insert("tili", synk.value("tili"));
+            ulos.insert("tyyppi", synk.value("tyyppi"));
+            ulos.insert("tunniste", synk.value("tunniste"));
+            ulos.insert("sarja", synk.value("sarja"));
+            ulos.insert("tila", synk.value("tila"));
+            ulos.insert("tositepvm", synk.value("tositepvm").toDate());
+            ulos.insert("selite", lasku.value("otsikko"));
+            ulos.insert("laskutapa", lasku.value("laskutapa"));
+            ulos.insert("numero", lasku.value("numero"));
+            ulos.insert("maksutapa", lasku.value("maksutapa"));
+            ulos.insert("valvonta", lasku.value("valvonta"));
+            lista.append(ulos);
+        }
+    }
+
     return lista;
 }
 
@@ -176,6 +255,11 @@ QString MyyntilaskutRoute::sqlKysymys(const QUrlQuery &urlquery, const QString &
     kysymys.append(QString(") as q ON vienti.eraid=q.eraid LEFT OUTER JOIN "
             "Kumppani ON vienti.kumppani=kumppani.id WHERE vienti.tyyppi = %1")
             .arg( hyvitys ? TositeVienti::OSTO + TositeVienti::VASTAKIRJAUS : TositeVienti::MYYNTI + TositeVienti::VASTAKIRJAUS) );
+
+    // Synteettiset negatiiviset erät (huoneisto/asiakas) käsitellään erikseen
+    // yhtenä rivinä per lasku, joten ne suljetaan pois täältä (muuten yksi
+    // kuukausittainen lasku toistuisi 12 rivillä).
+    kysymys.append(" AND vienti.eraid > 0 ");
 
 
     kysymys.append(ehdot);
