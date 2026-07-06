@@ -360,7 +360,10 @@ int TositeRoute::lisaaTaiPaivita(const QVariant pyynto, const int paivitettavanT
         kysely.addBindValue( debet ? debet : QVariant());
         kysely.addBindValue( kredit ? kredit : QVariant());
 
-        kysely.addBindValue( eraid > 0 ? eraid : QVariant());
+        // Positiiviset erät ja synteettiset negatiiviset erät (huoneisto/asiakas,
+        // eraid <= -2) talletetaan sellaisenaan. NULL vain kun eraid == 0 tai
+        // eraid == UUSI_ERA (-1); UUSI_ERA saa oman id:nsa alla rivilla.
+        kysely.addBindValue( (eraid > 0 || eraid < Kitsas::UUSI_ERA) ? eraid : QVariant());
         kysely.addBindValue( mapToJson(vientimap) );
         kysely.addBindValue( alvkoodi );
         kysely.addBindValue( alvkoodi ? QString::number(alvprosentti,'f',2) : QVariant());
