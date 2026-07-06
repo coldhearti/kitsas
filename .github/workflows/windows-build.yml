@@ -14,7 +14,13 @@
 #
 # Why the wrapper: qmake uses $(CXX) for BOTH real compiles AND the
 # moc_predefs.h step, which runs "cl -E" (preprocess only). sccache cannot
-# handle -E. cl-cache.bat routes -E to plain cl and everything else to sccache.
+# handle preprocess-only invocations. cl-cache.bat routes -E/-P to plain cl and
+# everything else to "sccache cl".
+#
+# IMPORTANT: the wrapper is referenced by BARE NAME (cl-cache.bat) via PATH, not
+# by absolute path. qmake mangles backslashes in QMAKE_CXX=<path>, which silently
+# drops the override and falls back to plain cl (sccache then records 0 compile
+# requests). The "Verify cache engaged" step fails the build if that happens.
 #
 # Why MSVC: the app links QtWebEngine (Chromium), which on Windows only builds
 # with MSVC. WebEngine is prebuilt from the Qt kit; we only link it.
@@ -37,6 +43,13 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Stamp build commit into versio.h
+        shell: bash
+        run: |
+          sha="$(git rev-parse --short HEAD)"
+          sed -i "s/#define KITSAS_BUILD .*/#define KITSAS_BUILD \"$sha\"/" kitsas/versio.h
+          echo "Stamped build:"; grep '#define KITSAS_BUILD' kitsas/versio.h
 
       - name: Install Qt
         uses: jurplel/install-qt-action@v4
@@ -68,15 +81,22 @@ jobs:
             sccache-${{ runner.os }}-${{ github.ref_name }}-
             sccache-${{ runner.os }}-
 
-      - name: Create sccache compiler wrapper
+      - name: Create sccache compiler wrapper (on PATH)
         shell: pwsh
         run: |
+          $dir = "$env:GITHUB_WORKSPACE\ccwrap"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
           $lines = @(
             '@echo off',
+            'setlocal',
             ':scan',
             'if "%~1"=="" goto compile',
-            'if /I "%~1"=="-E" goto raw',
-            'if /I "%~1"=="/E" goto raw',
+            'if /I "%~1"=="-E"  goto raw',
+            'if /I "%~1"=="/E"  goto raw',
+            'if /I "%~1"=="-EP" goto raw',
+            'if /I "%~1"=="/EP" goto raw',
+            'if /I "%~1"=="-P"  goto raw',
+            'if /I "%~1"=="/P"  goto raw',
             'shift',
             'goto scan',
             ':compile',
@@ -86,9 +106,12 @@ jobs:
             'cl %*',
             'exit /b %errorlevel%'
           )
-          Set-Content -Path "$env:GITHUB_WORKSPACE\cl-cache.bat" -Value $lines -Encoding Ascii
+          Set-Content -Path "$dir\cl-cache.bat" -Value $lines -Encoding Ascii
+          # Put the wrapper dir on PATH for subsequent steps so qmake can
+          # reference it by bare name (no backslash path for qmake to mangle).
+          "$dir" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
           Write-Host "---- cl-cache.bat ----"
-          Get-Content "$env:GITHUB_WORKSPACE\cl-cache.bat"
+          Get-Content "$dir\cl-cache.bat"
 
       - name: Remove unused openjpeg link
         shell: bash
@@ -97,18 +120,33 @@ jobs:
       - name: Build
         shell: pwsh
         run: |
-          $wrapper = "$env:GITHUB_WORKSPACE\cl-cache.bat"
+          Write-Host "cl-cache.bat resolves to: $((Get-Command cl-cache.bat).Source)"
+          Write-Host "sccache resolves to:      $((Get-Command sccache).Source)"
           mkdir build
           cd build
-          qmake ..\kitsas\kitsas.pro "CONFIG+=release" "QMAKE_CXX=$wrapper" "QMAKE_CC=$wrapper"
+          # Bare name (not an absolute path) so qmake doesn't mangle backslashes.
+          qmake ..\kitsas\kitsas.pro "CONFIG+=release" "QMAKE_CXX=cl-cache.bat" "QMAKE_CC=cl-cache.bat"
           Write-Host "---- CXX line in generated Makefile ----"
           Select-String -Path Makefile.Release -Pattern '^CXX' | Select-Object -First 1
           nmake
           if (!(Test-Path release\kitsas.exe)) { throw "kitsas.exe was not produced" }
 
-      - name: sccache stats
+      - name: Verify cache engaged
         shell: pwsh
-        run: sccache --show-stats
+        run: |
+          $stats = (sccache --show-stats | Out-String)
+          Write-Host $stats
+          if ($stats -match 'Compile requests\s+(\d+)') {
+            $req = [int]$Matches[1]
+            Write-Host "Parsed compile requests: $req"
+            if ($req -le 0) {
+              throw "sccache recorded 0 compile requests: the cl-cache wrapper was NOT used, so object caching is doing nothing. Failing so this does not regress silently."
+            }
+          } else {
+            Write-Warning "Could not parse sccache stats; skipping cache self-check."
+          }
+          # Flush the server so the on-disk cache is fully written before actions/cache saves it.
+          sccache --stop-server | Out-Null
 
       - name: Bundle Qt runtime
         shell: pwsh
