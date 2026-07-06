@@ -61,7 +61,7 @@ protected:
         QDate erapvm;                 // laskennallinen eräpäivä
         bool loytyi = false;          // erällä on rivejä
     };
-    EranTila eranTila(int eraid, const QDate& tanaan);
+    EranTila eranTila(int eraid, const QDate& tanaan, const QDate& saldopvm = QDate());
 
 protected:
     QSqlDatabase db();

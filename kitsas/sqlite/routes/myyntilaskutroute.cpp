@@ -138,6 +138,9 @@ QVariant MyyntilaskutRoute::get(const QString &/*polku*/, const QUrlQuery &urlqu
         QDate tanaan = QDate::currentDate();
         if( urlquery.hasQueryItem("eraloppupvm") )
             tanaan = QDate::fromString(urlquery.queryItemValue("eraloppupvm"), Qt::ISODate);
+        QDate saldopvm;
+        if( urlquery.hasQueryItem("saldopvm") )
+            saldopvm = QDate::fromString(urlquery.queryItemValue("saldopvm"), Qt::ISODate);
 
         QString synteesi = QString(
             "SELECT DISTINCT tosite.id AS tosite, tosite.laskupvm, tosite.viite, tosite.json, "
@@ -157,7 +160,7 @@ QVariant MyyntilaskutRoute::get(const QString &/*polku*/, const QUrlQuery &urlqu
         synk.exec(synteesi);
         while( synk.next() ) {
             const int eraid = synk.value("eraid").toInt();
-            const EranTila t = eranTila( eraid, tanaan );
+            const EranTila t = eranTila( eraid, tanaan, saldopvm );
 
             if( eraantynytTab ) {
                 if( !t.erapvm.isValid() || t.erapvm >= tanaan || t.avoinSnt <= 0 )

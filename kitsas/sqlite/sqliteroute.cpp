@@ -204,15 +204,21 @@ void SQLiteRoute::taydennaEratJaMerkkaukset(QVariantList &vientilista)
     }
 }
 
-SQLiteRoute::EranTila SQLiteRoute::eranTila(int eraid, const QDate &tanaan)
+SQLiteRoute::EranTila SQLiteRoute::eranTila(int eraid, const QDate &tanaan, const QDate &saldopvm)
 {
     EranTila t;
     QSqlQuery kysely( db() );
 
+    // Saldopäivän rajaus: raporteissa (esim. avoimet laskut annettuna päivänä)
+    // huomioidaan vain viennit saldopäivään asti. Tyhjä = ei rajausta.
+    const QString rajaus = saldopvm.isValid()
+            ? QString(" AND Vienti.pvm <= '%1' ").arg(saldopvm.toString(Qt::ISODate))
+            : QString();
+
     // Avoin saldo (debet - kredit) koko erälle
     kysely.exec(QString("SELECT COALESCE(SUM(debetsnt),0), COALESCE(SUM(kreditsnt),0) "
                         "FROM Vienti JOIN Tosite ON Vienti.tosite=Tosite.id "
-                        "WHERE Vienti.eraid=%1 AND Tosite.tila >= 100").arg(eraid));
+                        "WHERE Vienti.eraid=%1 AND Tosite.tila >= 100 %2").arg(eraid).arg(rajaus));
     if( kysely.next() ) {
         t.avoinSnt = kysely.value(0).toLongLong() - kysely.value(1).toLongLong();
         t.loytyi = true;
@@ -237,14 +243,14 @@ SQLiteRoute::EranTila SQLiteRoute::eranTila(int eraid, const QDate &tanaan)
         // erääntynyt = jo erääntyneet veloitukset - maksut.
         qlonglong maksettu = 0;
         kysely.exec(QString("SELECT COALESCE(SUM(kreditsnt),0) FROM Vienti JOIN Tosite ON Vienti.tosite=Tosite.id "
-                            "WHERE Vienti.eraid=%1 AND Tosite.tila >= 100").arg(eraid));
+                            "WHERE Vienti.eraid=%1 AND Tosite.tila >= 100 %2").arg(eraid).arg(rajaus));
         if( kysely.next() )
             maksettu = kysely.value(0).toLongLong();
 
         kysely.exec(QString("SELECT Vienti.pvm, COALESCE(Vienti.debetsnt,0) "
                             "FROM Vienti JOIN Tosite ON Vienti.tosite=Tosite.id "
-                            "WHERE Vienti.eraid=%1 AND Vienti.debetsnt IS NOT NULL AND Tosite.tila >= 100 "
-                            "ORDER BY Vienti.pvm, Vienti.id").arg(eraid));
+                            "WHERE Vienti.eraid=%1 AND Vienti.debetsnt IS NOT NULL AND Tosite.tila >= 100 %2 "
+                            "ORDER BY Vienti.pvm, Vienti.id").arg(eraid).arg(rajaus));
         qlonglong kertyma = 0;
         qlonglong eraantynytVeloitus = 0;
         while( kysely.next() ) {
