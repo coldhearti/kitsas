@@ -156,12 +156,13 @@ QVariant MyyntilaskutRoute::get(const QString &/*polku*/, const QUrlQuery &urlqu
             "SELECT tosite.id AS tosite, tosite.laskupvm AS laskupvm, tosite.viite AS viite, "
             "tosite.json AS json, kumppani.nimi AS asiakas, kumppani.id AS asiakasid, "
             "tosite.tyyppi AS tyyppi, tosite.tunniste AS tunniste, tosite.sarja AS sarja, "
-            "tosite.tila AS tila, vienti.pvm AS kkpvm, vienti.eraid AS eraid, vienti.tili AS tili, "
-            "COALESCE(vienti.debetsnt,0) AS velka "
+            "tosite.tila AS tila, vienti.pvm AS kkpvm, vienti.eraid AS eraid, "
+            "MIN(vienti.tili) AS tili, SUM(COALESCE(vienti.debetsnt,0)) AS velka "
             "FROM tosite JOIN Vienti ON vienti.tosite=tosite.id "
             "LEFT OUTER JOIN Kumppani ON vienti.kumppani=kumppani.id "
             "WHERE vienti.tyyppi=%1 AND vienti.eraid < 0 AND tosite.tila >= %2 %3 "
-            "ORDER BY vienti.eraid, vienti.pvm, vienti.id ")
+            "GROUP BY vienti.eraid, tosite.id, vienti.pvm "
+            "ORDER BY vienti.eraid, vienti.pvm, tosite.id ")
             .arg( TositeVienti::MYYNTI + TositeVienti::VASTAKIRJAUS )
             .arg( Tosite::KIRJANPIDOSSA )
             .arg( rajaus );

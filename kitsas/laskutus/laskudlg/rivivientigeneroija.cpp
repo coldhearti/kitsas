@@ -26,6 +26,7 @@
 #include "db/kitsasinterface.h"
 #include "db/asetusmodel.h"
 #include "db/tilimodel.h"
+#include "db/tili.h"
 
 
 #include "kitsas.h"
@@ -124,39 +125,100 @@ void RiviVientiGeneroija::generoiViennit(const QDate &pvm)
 
 void RiviVientiGeneroija::generoiVastavienti(const QDate &pvm)
 {
-    TositeVienti vienti;
-    vienti.setPvm( pvm );
-
     const Lasku& lasku = tosite_->constLasku();
     const AsetusModel* asetukset = kitsas_->asetukset();
     const int maksutapa = lasku.maksutapa();
 
-    if(eraId_ > 0)
-        vienti.setId(vastaVientiId_);
-
-
-    if( maksutapa == Lasku::KATEINEN) {
-        vienti.setTili( asetukset->luku(AsetusModel::LaskuKateistili) );
-    } else if (maksutapa == Lasku::KORTTIMAKSU) {
-        vienti.setTili( asetukset->luku(AsetusModel::LaskuKorttitili));
-    } else if (maksutapa == Lasku::ENNAKKOLASKU) {
-        vienti.setTili( asetukset->luku(AsetusModel::LaskuEnnakkosaatavaTili) );
-    }  else {
-        vienti.setTili( asetukset->luku(AsetusModel::LaskuSaatavaTili));
+    // Kateis-, kortti- ja ennakkolaskut kirjataan yhtenä vastakirjauksena
+    // kassaan / korttitilille / ennakkosaataviin. Näissä ei sovelleta
+    // tuottotilin vastatiliä (kohdetili on maksutavan mukainen).
+    if( maksutapa == Lasku::KATEINEN || maksutapa == Lasku::KORTTIMAKSU
+            || maksutapa == Lasku::ENNAKKOLASKU ) {
+        TositeVienti vienti;
+        vienti.setPvm( pvm );
+        if( eraId_ > 0 )
+            vienti.setId(vastaVientiId_);
+        if( maksutapa == Lasku::KATEINEN )
+            vienti.setTili( asetukset->luku(AsetusModel::LaskuKateistili) );
+        else if( maksutapa == Lasku::KORTTIMAKSU )
+            vienti.setTili( asetukset->luku(AsetusModel::LaskuKorttitili) );
+        else
+            vienti.setTili( asetukset->luku(AsetusModel::LaskuEnnakkosaatavaTili) );
+        vienti.setDebet( alv_.brutto() );
+        vienti.setKumppani( tosite_->kumppani() );
+        vienti.setTyyppi( TositeVienti::MYYNTI + TositeVienti::VASTAKIRJAUS );
+        vienti.setSelite( lasku.otsikko() );
+        if( maksutapa != Lasku::KATEINEN && maksutapa != Lasku::KORTTIMAKSU && eraId_ )
+            vienti.setEra(eraId_);
+        else
+            vienti.setEra(0);
+        tosite_->viennit()->lisaa(vienti);
+        return;
     }
 
-    vienti.setDebet( alv_.brutto() );
+    // Tavallinen myyntisaatava. Saatavatili valitaan ensisijaisesti tuottotilin
+    // 'vastatili'-määrityksen mukaan (jos asetettu), muuten yleinen
+    // LaskuSaatavatili. Rivit ryhmitellään saatavatilin mukaan yhdeksi
+    // vastakirjaukseksi per tili, jolloin esim. hoito- ja rahoitusvastikkeen
+    // saatavat päätyvät omille saatavatileilleen.
+    const int oletusSaatava = asetukset->luku(AsetusModel::LaskuSaatavaTili);
 
-    vienti.setKumppani( tosite_->kumppani() );
-    vienti.setTyyppi( TositeVienti::MYYNTI + TositeVienti::VASTAKIRJAUS );
-    vienti.setSelite( lasku.otsikko() );
+    QList<int> jarjestys;          // saatavatilit ensiesiintymisjärjestyksessä
+    QMap<int, Euro> summat;        // saatavatili -> brutto
+    Euro brutto;
+    for(int i=0; i < tosite_->rivit()->rowCount(); i++) {
+        const TositeRivi& rivi = tosite_->rivit()->rivi(i);
+        const Euro rivibrutto = rivi.bruttoYhteensa();
+        if( !rivibrutto )
+            continue;
+        int saatava = oletusSaatava;
+        const Tili tili = kitsas_->tilit()->tiliNumerolla( rivi.tili() );
+        if( tili.luku("vastatili") )
+            saatava = tili.luku("vastatili");
+        if( !summat.contains(saatava) )
+            jarjestys.append(saatava);
+        summat[saatava] = summat.value(saatava) + rivibrutto;
+        brutto += rivibrutto;
+    }
 
-    if( maksutapa != Lasku::KATEINEN && maksutapa != Lasku::KORTTIMAKSU && eraId_)
-        vienti.setEra(eraId_);
-    else
-        vienti.setEra(0);
+    // Poikkeustilanne (ei rivisummaa): yksi vastakirjaus oletustilille.
+    if( jarjestys.isEmpty() ) {
+        jarjestys.append(oletusSaatava);
+        summat[oletusSaatava] = alv_.brutto();
+    }
 
-    tosite_->viennit()->lisaa(vienti);
+    // Rivien bruttosumma voi pyöristyksen vuoksi poiketa alv-laskennan
+    // bruttosta muutaman sentin; oikaistaan erotus suurimpaan ryhmään, jotta
+    // tosite täsmää täsmälleen (vastakirjaukset == kirjaukset + verot).
+    const Euro tavoite = alv_.brutto();
+    if( brutto != tavoite ) {
+        int suurin = jarjestys.first();
+        for( int t : qAsConst(jarjestys) )
+            if( summat.value(t) > summat.value(suurin) )
+                suurin = t;
+        summat[suurin] = summat.value(suurin) + (tavoite - brutto);
+    }
+
+    bool ensimmainen = true;
+    for( int saatava : qAsConst(jarjestys) ) {
+        TositeVienti vienti;
+        vienti.setPvm( pvm );
+        // Erän avaava vienti (id == eraid) tarvitaan reskontrassa positiivisilla
+        // erillä; se annetaan ensimmäiselle riville.
+        if( eraId_ > 0 && ensimmainen )
+            vienti.setId(vastaVientiId_);
+        vienti.setTili( saatava );
+        vienti.setDebet( summat.value(saatava) );
+        vienti.setKumppani( tosite_->kumppani() );
+        vienti.setTyyppi( TositeVienti::MYYNTI + TositeVienti::VASTAKIRJAUS );
+        vienti.setSelite( lasku.otsikko() );
+        if( eraId_ )
+            vienti.setEra(eraId_);
+        else
+            vienti.setEra(0);
+        tosite_->viennit()->lisaa(vienti);
+        ensimmainen = false;
+    }
 }
 
 void RiviVientiGeneroija::generoiTiliviennit(const QDate &pvm)
