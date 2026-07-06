@@ -7,25 +7,20 @@
 #   2. C++ objects -> sccache writing to a LOCAL directory (SCCACHE_DIR),
 #                     persisted across runs by actions/cache@v4.
 #
-# Why not SCCACHE_GHA_ENABLED: that path uses GitHub's legacy cache API
-# (artifactcache.actions.githubusercontent.com), which now returns HTTP 400.
-# actions/cache@v4 uses the current cache service, so we persist a plain
-# sccache disk cache instead.
+# Why not SCCACHE_GHA_ENABLED: that path uses GitHub's legacy cache API, which
+# now returns HTTP 400. actions/cache@v4 uses the current service, so we persist
+# a plain sccache disk cache instead.
 #
-# How sccache is wired in: qmake does NOT reliably honor a QMAKE_CXX override
-# for the MSVC generator (an earlier attempt left sccache with 0 compile
-# requests). So instead we SHADOW the compiler: a cl.bat earlier on PATH than
-# the real cl.exe. nmake resolves "cl" (and $(CXX)) to cl.bat via PATH, and
-# cl.bat calls "sccache <real cl.exe>". The real compiler is invoked by full
-# path, so there is no recursion. As belt-and-suspenders we also pass
-# QMAKE_CXX/QMAKE_CC=cl.bat; whichever mechanism qmake honors, it ends at cl.bat.
+# How sccache is wired in: neither a QMAKE_CXX override nor a PATH shadow made
+# qmake's MSVC build call the wrapper (sccache kept seeing 0 compile requests),
+# because qmake bakes the compiler into the generated Makefile. So we let qmake
+# generate normally, then REWRITE the CXX/CC macro in Makefile.Release to point
+# at cl.bat. cl.bat calls "sccache <real cl.exe>" (real compiler by full path ->
+# no recursion); preprocess-only steps (-E/-P, e.g. moc_predefs) go straight to
+# the real cl since sccache can't cache them.
 #
-# Preprocess-only steps (moc_predefs.h runs the compiler with -E/-P) cannot go
-# through sccache, so cl.bat routes those directly to the real cl.exe.
-#
-# The "Verify cache engaged" step reports whether sccache actually saw compiles.
-# It only WARNS (does not fail the build), so a caching hiccup never blocks
-# producing the artifact.
+# The "Verify cache engaged" step only reports (never fails the build) so a
+# caching hiccup can't block producing the artifact.
 #
 # Why MSVC: the app links QtWebEngine (Chromium), which on Windows only builds
 # with MSVC. WebEngine is prebuilt from the Qt kit; we only link it.
@@ -90,13 +85,12 @@ jobs:
       - name: Build
         shell: pwsh
         run: |
-          # Capture the REAL compiler before shadowing it.
           $real = (Get-Command cl.exe).Source
           if (-not $real) { throw "cl.exe not found; MSVC env not set up" }
           Write-Host "Real cl.exe: $real"
 
-          # cl.bat: route preprocess-only (-E/-P) straight to the real cl,
-          # everything else through sccache. Real cl called by full path -> no recursion.
+          # cl.bat: preprocess-only (-E/-P) -> real cl; everything else -> sccache.
+          # Real cl invoked by full path, so no recursion.
           $wrap = "$env:GITHUB_WORKSPACE\ccwrap"
           New-Item -ItemType Directory -Force -Path $wrap | Out-Null
           $bat = @(
@@ -119,23 +113,36 @@ jobs:
             'exit /b %errorlevel%'
           )
           Set-Content -Path "$wrap\cl.bat" -Value $bat -Encoding Ascii
-          Write-Host "---- cl.bat ----"; Get-Content "$wrap\cl.bat"
-
-          # Put the shadow first on PATH for nmake in THIS step only.
-          $env:PATH = "$wrap;$env:PATH"
+          $clbat = "$wrap\cl.bat"
+          Write-Host "Wrapper: $clbat"
 
           mkdir build
           cd build
-          qmake ..\kitsas\kitsas.pro "CONFIG+=release" "QMAKE_CXX=cl.bat" "QMAKE_CC=cl.bat"
-          Write-Host "---- CXX line in generated Makefile ----"
-          Select-String -Path Makefile.Release -Pattern '^CXX' | Select-Object -First 1
+          qmake ..\kitsas\kitsas.pro "CONFIG+=release"
+
+          # Force the wrapper into the generated makefile(s), regardless of how
+          # qmake spelled the compiler. This is what actually engages sccache.
+          foreach ($mk in @("Makefile", "Makefile.Release")) {
+            if (Test-Path $mk) {
+              Write-Host "---- $mk CXX/CC before ----"
+              Select-String -Path $mk -Pattern '^(CXX|CC)\s*=' | ForEach-Object { $_.Line }
+              (Get-Content $mk) `
+                -replace '^(CXX\s*=\s*).*$', ('${1}' + $clbat) `
+                -replace '^(CC\s*=\s*).*$',  ('${1}' + $clbat) `
+                | Set-Content $mk
+              Write-Host "---- $mk CXX/CC after ----"
+              Select-String -Path $mk -Pattern '^(CXX|CC)\s*=' | ForEach-Object { $_.Line }
+            }
+          }
+
           nmake
           if (!(Test-Path release\kitsas.exe)) { throw "kitsas.exe was not produced" }
 
       - name: Verify cache engaged (non-fatal)
         shell: pwsh
         run: |
-          $stats = (sccache --show-stats | Out-String)
+          $stats = ""
+          try { $stats = (sccache --show-stats 2>&1 | Out-String) } catch { }
           Write-Host $stats
           if ($stats -match 'Compile requests\s+(\d+)') {
             $req = [int]$Matches[1]
@@ -147,7 +154,8 @@ jobs:
           } else {
             Write-Warning "Could not parse sccache stats."
           }
-          sccache --stop-server | Out-Null
+          try { sccache --stop-server 2>&1 | Out-Null } catch { }
+          exit 0
 
       - name: Bundle Qt runtime
         shell: pwsh
