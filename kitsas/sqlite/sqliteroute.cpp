@@ -163,7 +163,18 @@ void SQLiteRoute::taydennaEratJaMerkkaukset(QVariantList &vientilista)
         if( map.contains("era")) {
             QVariantMap eramap = map.value("era").toMap();
             int eraid = eramap.value("id").toInt();
-            if( eraid ) {
+            if( eraid < 0 ) {
+                // Synteettinen era (huoneisto/asiakas): ei omaa avaavaa Vienti-riviä,
+                // joten sitä ei voi hakea Vienti.id:llä. Eraa EI saa poistaa, koska
+                // silloin se katoaisi tositteen uudelleentallennuksessa (eraid -> NULL)
+                // ja huoneiston/asiakkaan seuranta rikkoutuisi. Säilytetään id ja
+                // lasketaan eran saldo.
+                kysely.exec(QString("SELECT SUM(debetsnt), SUM(kreditsnt) FROM Vienti JOIN Tosite ON Vienti.tosite=Tosite.id WHERE eraid=%1 AND Tosite.tila >= 100 ").arg(eraid));
+                if( kysely.next())
+                    eramap.insert("saldo", (kysely.value(0).toLongLong() - kysely.value(1).toLongLong()) / 100.0);
+                map.insert("era", eramap);
+                vientilista[i] = map;
+            } else if( eraid ) {
                 kysely.exec(QString("SELECT Vienti.id as id, Tosite.tunniste as tunniste, Tosite.sarja as sarja, Tosite.pvm as pvm, Tosite.tyyppi as tositetyyppi "
                                     "FROM Vienti JOIN Tosite ON Vienti.tosite=Tosite.id "
                                     "WHERE Vienti.id=%1")
