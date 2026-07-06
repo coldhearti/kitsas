@@ -126,10 +126,11 @@ QVariant MyyntilaskutRoute::get(const QString &/*polku*/, const QUrlQuery &urlqu
         }
     }
 
-    // Synteettiset negatiiviset erät (huoneisto/asiakas): yksi rivi per lasku,
-    // avoin ja laskennallinen eräpäivä johdetaan erän riveiltä (jaettu logiikka).
-    // Näin kuukausittainen huoneistolasku näkyy avoimissa/erääntyneissä samoin
-    // kuin pilvipalvelussa, vaikka otsikon erapvm on tyhjä.
+    // Synteettiset negatiiviset erät (huoneisto/asiakas): kuukausittaisen
+    // laskun JOKAINEN kuukausiveloitus (vastavienti, tyyppi 202) palautetaan
+    // omana rivinään omalla eräpäivällään, kuten pilvipalvelussa. Maksut
+    // kohdennetaan vanhimmille kuukausille (FIFO), jolloin avoimet ja
+    // erääntyneet kuukaudet näkyvät oikein. Otsikon erapvm on tyhjä.
     if( !urlquery.hasQueryItem("luonnos") && !urlquery.hasQueryItem("lahetettava")
         && urlquery.queryItemValue("avoin") != "maksut" ) {
 
@@ -138,57 +139,82 @@ QVariant MyyntilaskutRoute::get(const QString &/*polku*/, const QUrlQuery &urlqu
         QDate tanaan = QDate::currentDate();
         if( urlquery.hasQueryItem("eraloppupvm") )
             tanaan = QDate::fromString(urlquery.queryItemValue("eraloppupvm"), Qt::ISODate);
-        QDate saldopvm;
-        if( urlquery.hasQueryItem("saldopvm") )
-            saldopvm = QDate::fromString(urlquery.queryItemValue("saldopvm"), Qt::ISODate);
+        const QString saldopvm = urlquery.queryItemValue("saldopvm");
+        const QString rajaus = saldopvm.isEmpty() ? QString()
+                : QString(" AND Vienti.pvm <= '%1' ").arg(saldopvm);
+        QDate alkupvm, loppupvm;
+        if( urlquery.hasQueryItem("alkupvm") )
+            alkupvm = QDate::fromString(urlquery.queryItemValue("alkupvm"), Qt::ISODate);
+        if( urlquery.hasQueryItem("loppupvm") )
+            loppupvm = QDate::fromString(urlquery.queryItemValue("loppupvm"), Qt::ISODate);
 
+        // Kaikki synteettisten erien kuukausiveloitukset aikajärjestyksessä.
+        // Aikaväliä EI rajata SQL:ssä, jotta maksujen FIFO-kohdennus aiempiin
+        // (mahdollisesti näyttövälin ulkopuolisiin) kuukausiin säilyy oikein;
+        // näyttörajaus tehdään vasta kohdennuksen jälkeen.
         QString synteesi = QString(
-            "SELECT DISTINCT tosite.id AS tosite, tosite.laskupvm, tosite.viite, tosite.json, "
-            "kumppani.nimi AS asiakas, kumppani.id AS asiakasid, tosite.tyyppi, tosite.tunniste, "
-            "tosite.sarja, tosite.tila, tosite.pvm AS tositepvm, vienti.eraid, vienti.tili "
+            "SELECT tosite.id AS tosite, tosite.laskupvm AS laskupvm, tosite.viite AS viite, "
+            "tosite.json AS json, kumppani.nimi AS asiakas, kumppani.id AS asiakasid, "
+            "tosite.tyyppi AS tyyppi, tosite.tunniste AS tunniste, tosite.sarja AS sarja, "
+            "tosite.tila AS tila, vienti.pvm AS kkpvm, vienti.eraid AS eraid, vienti.tili AS tili, "
+            "COALESCE(vienti.debetsnt,0) AS velka "
             "FROM tosite JOIN Vienti ON vienti.tosite=tosite.id "
             "LEFT OUTER JOIN Kumppani ON vienti.kumppani=kumppani.id "
-            "WHERE vienti.tyyppi=%1 AND vienti.eraid < 0 AND tosite.tila >= %2 ")
+            "WHERE vienti.tyyppi=%1 AND vienti.eraid < 0 AND tosite.tila >= %2 %3 "
+            "ORDER BY vienti.eraid, vienti.pvm, vienti.id ")
             .arg( TositeVienti::MYYNTI + TositeVienti::VASTAKIRJAUS )
-            .arg( Tosite::KIRJANPIDOSSA );
-        if( urlquery.hasQueryItem("alkupvm") )
-            synteesi.append(QString(" AND tosite.laskupvm >= '%1' ").arg(urlquery.queryItemValue("alkupvm")));
-        if( urlquery.hasQueryItem("loppupvm") )
-            synteesi.append(QString(" AND tosite.laskupvm <= '%1' ").arg(urlquery.queryItemValue("loppupvm")));
+            .arg( Tosite::KIRJANPIDOSSA )
+            .arg( rajaus );
 
         QSqlQuery synk( db() );
         synk.exec(synteesi);
+
+        int nykyEra = 0;
+        bool eraAloitettu = false;
+        qlonglong maksukate = 0;   // FIFO: jäljellä oleva kohdentamaton maksukate
         while( synk.next() ) {
             const int eraid = synk.value("eraid").toInt();
-            const EranTila t = eranTila( eraid, tanaan, saldopvm );
-
-            if( eraantynytTab ) {
-                if( !t.erapvm.isValid() || t.erapvm >= tanaan || t.avoinSnt <= 0 )
-                    continue;
-            } else if( avoinTab ) {
-                if( t.avoinSnt == 0 )
-                    continue;
+            if( !eraAloitettu || eraid != nykyEra ) {
+                eraAloitettu = true;
+                nykyEra = eraid;
+                // Erän maksut yhteensä (saldopäivään asti) FIFO-kohdennukseen.
+                maksukate = 0;
+                QSqlQuery mk( db() );
+                mk.exec(QString("SELECT COALESCE(SUM(kreditsnt),0) FROM Vienti "
+                                "JOIN Tosite ON Vienti.tosite=Tosite.id "
+                                "WHERE Vienti.eraid=%1 AND Tosite.tila >= %2 %3")
+                        .arg(eraid).arg(Tosite::KIRJANPIDOSSA).arg(rajaus));
+                if( mk.next() ) maksukate = mk.value(0).toLongLong();
             }
 
-            // Laskun kokonaissumma = tämän laskun saatavaveloitukset
-            qlonglong summaSnt = 0;
-            QSqlQuery sq( db() );
-            sq.exec(QString("SELECT COALESCE(SUM(debetsnt),0) FROM Vienti WHERE tosite=%1 AND tyyppi=%2")
-                    .arg(synk.value("tosite").toInt())
-                    .arg(TositeVienti::MYYNTI + TositeVienti::VASTAKIRJAUS));
-            if( sq.next() ) summaSnt = sq.value(0).toLongLong();
+            const qlonglong velka = synk.value("velka").toLongLong();
+            const qlonglong kohdennus = qMin( maksukate, velka );  // FIFO vanhimmasta
+            maksukate -= kohdennus;
+            const qlonglong avoinSnt = velka - kohdennus;
+
+            const QDate kkpvm = synk.value("kkpvm").toDate();
+
+            // Näyttörajaus aikavälille kuukauden eräpäivän mukaan.
+            if( alkupvm.isValid() && kkpvm < alkupvm ) continue;
+            if( loppupvm.isValid() && kkpvm > loppupvm ) continue;
+
+            // Välilehtien (Avoimet / Erääntyneet) suodatus per kuukausi.
+            if( eraantynytTab ) {
+                if( kkpvm >= tanaan || avoinSnt <= 0 ) continue;
+            } else if( avoinTab ) {
+                if( avoinSnt <= 0 ) continue;
+            }
 
             const QVariantMap lasku = QJsonDocument::fromJson( synk.value("json").toByteArray() )
                                         .toVariant().toMap().value("lasku").toMap();
 
             QVariantMap ulos;
             ulos.insert("tosite", synk.value("tosite"));
-            ulos.insert("pvm", synk.value("laskupvm").toDate());
-            if( t.erapvm.isValid() )
-                ulos.insert("erapvm", t.erapvm);
+            ulos.insert("pvm", kkpvm);
+            ulos.insert("erapvm", kkpvm);
             ulos.insert("viite", synk.value("viite"));
-            ulos.insert("summa", Euro(summaSnt).toString());
-            ulos.insert("avoin", Euro(t.avoinSnt).toString());
+            ulos.insert("summa", Euro(velka).toString());
+            ulos.insert("avoin", Euro(avoinSnt).toString());
             ulos.insert("asiakas", synk.value("asiakas"));
             ulos.insert("asiakasid", synk.value("asiakasid"));
             ulos.insert("eraid", eraid);
@@ -197,7 +223,7 @@ QVariant MyyntilaskutRoute::get(const QString &/*polku*/, const QUrlQuery &urlqu
             ulos.insert("tunniste", synk.value("tunniste"));
             ulos.insert("sarja", synk.value("sarja"));
             ulos.insert("tila", synk.value("tila"));
-            ulos.insert("tositepvm", synk.value("tositepvm").toDate());
+            ulos.insert("tositepvm", kkpvm);
             ulos.insert("selite", lasku.value("otsikko"));
             ulos.insert("laskutapa", lasku.value("laskutapa"));
             ulos.insert("numero", lasku.value("numero"));
