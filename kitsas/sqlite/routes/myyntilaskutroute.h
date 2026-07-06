@@ -19,6 +19,8 @@
 
 #include "../sqliteroute.h"
 
+class QDate;
+
 class MyyntilaskutRoute : public SQLiteRoute
 {
 public:
@@ -26,6 +28,7 @@ public:
     QVariant get(const QString &polku, const QUrlQuery &urlquery = QUrlQuery()) override;
 
 protected:
+    QVariant uusittavat(const QDate& pvm);
     QString sqlKysymys(const QUrlQuery& urlquery, const QString& ehdot, bool hyvitys = false) const;
 };
 

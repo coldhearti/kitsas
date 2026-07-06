@@ -45,8 +45,7 @@ void LaskunUusinta::uusiLaskut()
 {
     timer_.stop();
 
-    if( qobject_cast<PilviModel*>(kp()->yhteysModel()) &&
-        kp()->yhteysModel()->onkoOikeutta( YhteysModel::LASKU_LAATIMINEN ) && !busy_) {
+    if( kp()->yhteysModel()->onkoOikeutta( YhteysModel::LASKU_LAATIMINEN ) && !busy_) {
         KpKysely *kysely = kpk("/myyntilaskut");
         kysely->lisaaAttribuutti("uusittavat", kp()->paivamaara());
         connect( kysely, &KpKysely::vastaus, this, &LaskunUusinta::listaSaapuu);
@@ -142,7 +141,12 @@ void LaskunUusinta::uusittavaLadattu()
     paivitaHinnat();
 
     RiviVientiGeneroija riviGeneroija(kp());
-    riviGeneroija.generoiViennit(uusi_, Kitsas::UUSI_ERA);
+    // ASIAKAS/HUONEISTO-laskut kuuluvat asiakkaan/huoneiston jaettuun (negatiiviseen)
+    // erään, joten annetaan generaattorin laskea era valvonnasta (eraId=0). Muut
+    // laskut saavat uuden erän kuten ennenkin.
+    const int eraHint = (lasku.valvonta() == Lasku::ASIAKAS || lasku.valvonta() == Lasku::HUONEISTO)
+                            ? 0 : Kitsas::UUSI_ERA;
+    riviGeneroija.generoiViennit(uusi_, eraHint);
 
     if( tosite_->kumppani() ) {
         KpKysely* asiakasHaku = kpk(QString("/kumppanit/%1").arg(tosite_->kumppani()));

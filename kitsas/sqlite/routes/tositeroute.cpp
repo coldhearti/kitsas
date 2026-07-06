@@ -121,6 +121,14 @@ QVariant TositeRoute::patch(const QString &polku, const QVariant &data)
 {
     QVariantMap map = data.toMap();
     int tositeid = polku.toInt();
+
+    // Toistuvan laskun asetus (laskutoisto) päivitetään suoraan tositteen
+    // json-kenttään koskematta tilaan. Ilman tätä laskutoisto-patch menisi
+    // alla olevaan tila-käsittelyyn, jossa puuttuva "tila" tulkittaisiin
+    // nollaksi ja tosite poistuisi.
+    if( map.contains("laskutoisto"))
+        return patchLaskutoisto(tositeid, map);
+
     int tila = map.value("tila").toInt();
 
     // Haetaan tunniste
@@ -164,6 +172,46 @@ QVariant TositeRoute::patch(const QString &polku, const QVariant &data)
     db().commit();
     return QVariant();
 
+}
+
+QVariant TositeRoute::patchLaskutoisto(int tositeid, const QVariantMap &map)
+{
+    db().transaction();
+    QSqlQuery kysely(db());
+
+    kysely.exec(QString("SELECT tila, json FROM Tosite WHERE id=%1").arg(tositeid));
+    if( !kysely.next()) {
+        db().rollback();
+        throw SQLiteVirhe("Tositetta ei loydy", 404);
+    }
+    const int tila = kysely.value(0).toInt();
+    QVariantMap tositeMap = QJsonDocument::fromJson( kysely.value(1).toByteArray() ).toVariant().toMap();
+    QVariantMap laskuMap = tositeMap.value("lasku").toMap();
+
+    // Tyhja/puuttuva laskutoisto lopettaa toiston, muuten asettaa sen.
+    const QVariantMap toisto = map.value("laskutoisto").toMap();
+    if( toisto.isEmpty())
+        laskuMap.remove("toisto");
+    else
+        laskuMap.insert("toisto", toisto);
+    tositeMap.insert("lasku", laskuMap);
+
+    kysely.prepare("UPDATE Tosite SET json=? WHERE id=?");
+    kysely.addBindValue( mapToJson(tositeMap) );
+    kysely.addBindValue( tositeid );
+    if( !kysely.exec()) {
+        db().rollback();
+        throw SQLiteVirhe(kysely);
+    }
+
+    kysely.prepare("INSERT INTO Tositeloki (tosite, tila, data) VALUES (?,?,?)");
+    kysely.addBindValue(tositeid);
+    kysely.addBindValue(tila);
+    kysely.addBindValue(mapToJson(map));
+    kysely.exec();
+
+    db().commit();
+    return QVariant();
 }
 
 QVariant TositeRoute::doDelete(const QString &polku)

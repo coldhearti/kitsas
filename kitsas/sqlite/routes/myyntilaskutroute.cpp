@@ -20,6 +20,7 @@
 #include "model/tosite.h"
 
 #include <QJsonDocument>
+#include <QDate>
 #include <QDebug>
 
 MyyntilaskutRoute::MyyntilaskutRoute(SQLiteModel *model)
@@ -32,6 +33,10 @@ MyyntilaskutRoute::MyyntilaskutRoute(SQLiteModel *model)
 
 QVariant MyyntilaskutRoute::get(const QString &/*polku*/, const QUrlQuery &urlquery)
 {
+    // Toistuvat laskut, joiden uusintapaiva on koittanut
+    if( urlquery.hasQueryItem("uusittavat"))
+        return uusittavat( QDate::fromString( urlquery.queryItemValue("uusittavat"), Qt::ISODate) );
+
     // Laskutapa on json:n sisällä !
     QString ehdot = " AND ( tosite.tila ";
 
@@ -120,6 +125,30 @@ QVariant MyyntilaskutRoute::get(const QString &/*polku*/, const QUrlQuery &urlqu
         }
     }
 
+    return lista;
+}
+
+QVariant MyyntilaskutRoute::uusittavat(const QDate &pvm)
+{
+    QVariantList lista;
+    QSqlQuery kysely( db());
+    // Esisuodatus SQL:llä; toistoehto luetaan json:sta (kuten muuallakin
+    // tassa reitissa), jottei olla riippuvaisia SQLiten json-laajennoksesta.
+    kysely.exec("SELECT id, json FROM Tosite WHERE tyyppi >= 210 AND tyyppi <= 219 AND tila >= "
+                + QString::number(Tosite::VALMISLASKU));
+    while( kysely.next()) {
+        const QVariantMap lasku = QJsonDocument::fromJson( kysely.value(1).toByteArray() )
+                                    .toVariant().toMap().value("lasku").toMap();
+        const QVariantMap toisto = lasku.value("toisto").toMap();
+        if( toisto.isEmpty())
+            continue;
+        const QDate toistoPvm = toisto.value("pvm").toDate();
+        if( !toistoPvm.isValid() || toistoPvm > pvm)
+            continue;
+        QVariantMap ulos;
+        ulos.insert("id", kysely.value(0).toInt());
+        lista.append(ulos);
+    }
     return lista;
 }
 

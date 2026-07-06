@@ -34,6 +34,7 @@ public:
 
 protected:
     int lisaaTaiPaivita(const QVariant pyynto, const int paivitettavanTositeId = 0);
+    QVariant patchLaskutoisto(int tositeid, const QVariantMap& map);
     QVariantList lokinpurku(QSqlQuery &kysely) const;
 
     QVariant hae(int tositeId);
