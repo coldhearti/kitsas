@@ -56,32 +56,63 @@ QVariant EraRoute::get(const QString &polku, const QUrlQuery &urlquery)
     if( !urlquery.hasQueryItem("kaikki") )
                    kysymys.append("HAVING sum(vienti.debetsnt) <> sum(vienti.kreditsnt) OR sum(vienti.debetsnt) IS NULL OR sum(vienti.kreditsnt) IS NULL");
 
-    kysely.exec(kysymys);
-    while( kysely.next()) {
-        QString tili = kysely.value("tili").toString();
-        double debet = kysely.value(1).toLongLong() / 100.0;
-        double kredit = kysely.value(2).toLongLong() / 100.0;
+    // Rakennetaan tuloslista. Sekä tavalliset (positiiviset) että synteettiset
+    // negatiiviset erät palauttavat samat sarakenimet, joten sama rakentaja käy.
+    auto lisaaRivi = [&lista](QSqlQuery& q) {
+        QString tili = q.value("tili").toString();
+        double debet = q.value(1).toLongLong() / 100.0;
+        double kredit = q.value(2).toLongLong() / 100.0;
         double avoin = tili.startsWith('1') ?
                     debet - kredit :
                     kredit - debet;
 
         QVariantMap map;
-        map.insert("id", kysely.value(0).toInt());
+        map.insert("id", q.value(0).toInt());
         map.insert("tili", tili);
         map.insert("avoin", avoin);
-        map.insert("selite", kysely.value("selite"));
-        map.insert("pvm", kysely.value("pvm").toDate());
-        map.insert("tunniste", kysely.value("tunniste"));
-        if( !kysely.value("sarja").toString().isEmpty())
-            map.insert("sarja", kysely.value("sarja"));
-        if( kysely.value("kumppani").toInt()) {
+        map.insert("selite", q.value("selite"));
+        map.insert("pvm", q.value("pvm").toDate());
+        map.insert("tunniste", q.value("tunniste"));
+        if( !q.value("sarja").toString().isEmpty())
+            map.insert("sarja", q.value("sarja"));
+        if( q.value("kumppani").toInt()) {
            QVariantMap kumppaniMap;
-           kumppaniMap.insert("nimi", kysely.value("nimi"));
-           kumppaniMap.insert("id", kysely.value("kumppani"));
+           kumppaniMap.insert("nimi", q.value("nimi"));
+           kumppaniMap.insert("id", q.value("kumppani"));
            map.insert("kumppani", kumppaniMap);
         }
         lista.append(map);
-    }
+    };
+
+    kysely.exec(kysymys);
+    while( kysely.next())
+        lisaaRivi(kysely);
+
+    // Synteettiset negatiiviset erät (huoneisto/asiakas) eivät synny avaavasta
+    // viennistä, jonka id == eraid, joten yllä oleva itseliitos pudottaa ne.
+    // Ryhmitellään ne suoraan eraid:n mukaan ja kootaan otsikkotiedot riveiltä.
+    // Otsikkotiedot poimitaan erän aikaisimmalta riviltä: yksi min(Vienti.pvm)
+    // ohjaa SQLiten "bare column" -valinnan siihen riviin, jolloin selite yms.
+    // tulee ensimmäiseltä laskuriviltä eikä esim. myöhemmältä suoritukselta.
+    QString negkysymys("select vienti.eraid as eraid, sum(vienti.debetsnt) as sd, sum(vienti.kreditsnt) as sk, "
+                       "t.otsikko as selite, min(Vienti.pvm) as pvm, vienti.tili as tili, "
+                       "t.tunniste as tunniste, t.sarja as sarja, t.tyyppi as tositetyyppi, "
+                       "vienti.kumppani as kumppani, Kumppani.nimi as nimi "
+                       "FROM Vienti JOIN Tosite AS t ON vienti.tosite=t.id "
+                       "LEFT OUTER JOIN Kumppani ON vienti.kumppani=Kumppani.id "
+                       "WHERE t.tila >= 100 AND vienti.eraid < 0 ");
+    if( urlquery.hasQueryItem("tili"))
+        negkysymys.append(QString("AND vienti.tili=%1 ").arg(urlquery.queryItemValue("tili")));
+    if( urlquery.hasQueryItem("asiakas"))
+        negkysymys.append(QString("AND vienti.kumppani=%1 ").arg(urlquery.queryItemValue("asiakas")));
+    negkysymys.append("GROUP BY vienti.eraid, vienti.tili ");
+    if( !urlquery.hasQueryItem("kaikki") )
+        negkysymys.append("HAVING sum(vienti.debetsnt) <> sum(vienti.kreditsnt) OR sum(vienti.debetsnt) IS NULL OR sum(vienti.kreditsnt) IS NULL");
+
+    kysely.exec(negkysymys);
+    while( kysely.next())
+        lisaaRivi(kysely);
+
     return lista;
 }
 
@@ -262,6 +293,84 @@ QVariant EraRoute::taysiErittely(Tili *tili, const QDate &mista, const QDate &mi
         eritellytLopussa += eranKaudenAlussa + eranMuutos;
     }
 
+    // Synteettiset negatiiviset erät (huoneisto/asiakas): ei avaavaa vientiä
+    // (id == eraid), joten ne eivät osu ylläolevaan kyselyyn eivätkä
+    // erittelemättömiin (eraid EI ole NULL). Kootaan ne suoraan eraid:n mukaan.
+    QSqlQuery negErat( db() );
+    negErat.exec( QString("SELECT DISTINCT vienti.eraid FROM Vienti JOIN Tosite ON vienti.tosite=Tosite.id "
+                          "WHERE vienti.tili=%1 AND vienti.eraid < 0 AND Vienti.pvm <= '%2' AND Tosite.tila >= 100")
+                  .arg( tili->numero() ).arg( mihin.toString(Qt::ISODate) ) );
+    QList<int> negEraIdt;
+    while( negErat.next() )
+        negEraIdt.append( negErat.value(0).toInt() );
+
+    for( int eraid : negEraIdt ) {
+        QSqlQuery apukysely( db() );
+
+        // Erän saldo kauden alussa
+        Euro eranKaudenAlussa;
+        apukysely.exec(QString("SELECT sum(debetsnt), sum(kreditsnt) FROM Vienti JOIN Tosite ON Vienti.tosite=Tosite.id WHERE eraid=%1 AND Vienti.pvm<'%2' AND Tosite.tila >= 100 ")
+                       .arg(eraid).arg(mista.toString(Qt::ISODate)));
+        if( apukysely.next()) {
+           eranKaudenAlussa = Euro(tili->onko(TiliLaji::VASTAAVAA) ?
+                        apukysely.value(0).toLongLong() - apukysely.value(1).toLongLong() :
+                        apukysely.value(1).toLongLong() - apukysely.value(0).toLongLong() );
+        }
+
+        // Kauden muutokset: kaikki erän rivit kaudella (ei erillistä avaajaa)
+        apukysely.exec(QString("select vienti.debetsnt, vienti.kreditsnt, vienti.selite, Tosite.pvm as pvm, Tosite.sarja, "
+                               "Tosite.tunniste, tosite.id, Vienti.pvm as vientipvm, Kumppani.nimi AS kumppaninimi "
+                               "FROM Vienti JOIN Tosite ON Vienti.tosite = Tosite.id "
+                               "LEFT OUTER JOIN Kumppani ON Vienti.kumppani = Kumppani.id "
+                               "WHERE Vienti.eraid=%1 "
+                               "AND Vienti.pvm BETWEEN '%2' AND '%3' AND Tosite.tila >= 100 ORDER BY Vienti.pvm")
+                       .arg(QString::number(eraid), mista.toString(Qt::ISODate), mihin.toString(Qt::ISODate)));
+        QVariantList muutokset;
+        Euro eranMuutos;
+        QVariantMap era;
+        while( apukysely.next() )
+        {
+            Euro summa = Euro(tili->onko(TiliLaji::VASTAAVAA) ?
+                        apukysely.value(0).toLongLong() - apukysely.value(1).toLongLong() :
+                        apukysely.value(1).toLongLong() - apukysely.value(0).toLongLong() );
+            QVariantMap map;
+            map.insert("pvm", apukysely.value(3).toDate());
+            map.insert("sarja", apukysely.value(4));
+            map.insert("tunniste", apukysely.value(5));
+            map.insert("id", apukysely.value(6).toInt());
+            map.insert("vientipvm", apukysely.value(7).toDate());
+            map.insert("selite", apukysely.value(2).toString());
+            map.insert("eur", summa.toString());
+            map.insert("kumppani", apukysely.value("kumppaninimi"));
+            eranMuutos += summa;
+            muutokset.append(map);
+
+            // Erän otsikkorivi = erän aikaisin kauden rivi (luonteva "avaaja")
+            if( era.isEmpty()) {
+                era.insert("id", eraid);
+                era.insert("vientipvm", apukysely.value(7).toDate());
+                era.insert("pvm", apukysely.value(3).toDate());
+                era.insert("sarja", apukysely.value(4));
+                era.insert("tunniste", apukysely.value(5));
+                era.insert("selite", apukysely.value(2).toString());
+                era.insert("kumppani", apukysely.value("kumppaninimi"));
+                era.insert("eur", summa.toString());
+            }
+        }
+        if( !eranMuutos && !eranKaudenAlussa )
+            continue;
+
+        QVariantMap emap;
+        emap.insert("era", era);
+        emap.insert("ennen", eranKaudenAlussa);
+        emap.insert("kausi", muutokset);
+        emap.insert("saldo",  eranKaudenAlussa + eranMuutos);
+        erat.append(emap);
+
+        erittellytAlussa += eranKaudenAlussa;
+        eritellytLopussa += eranKaudenAlussa + eranMuutos;
+    }
+
     Euro erittelematonAlussa = alkusaldo - erittellytAlussa;
     Euro erittelematonLopussa = loppusaldo - eritellytLopussa;
     Euro erittelematonKausiSumma;
@@ -329,6 +438,36 @@ QVariant EraRoute::listaErittely(Tili *tili, const QDate & /* mista */, const QD
         era.insert("vientipvm", apukysely.value(7).toDate());
         era.insert("selite", apukysely.value(3));
         era.insert("kumppani", apukysely.value("kumppani"));
+        Euro summa = Euro(tili->onko(TiliLaji::VASTAAVAA) ?
+                    apukysely.value(1).toLongLong() - apukysely.value(2).toLongLong() :
+                    apukysely.value(2).toLongLong() - apukysely.value(1).toLongLong() );
+        era.insert("eur", summa);
+        erat.append(era);
+        erittelematta -= summa;
+    }
+
+    // Synteettiset negatiiviset erät (huoneisto/asiakas): ryhmitellään suoraan
+    // eraid:n mukaan, koska niillä ei ole avaavaa vientiä (id == eraid).
+    apukysely.exec(QString("select vienti.eraid, sum(vienti.debetsnt) as sd, sum(vienti.kreditsnt) as sk, "
+                           "Tosite.otsikko as selite, Tosite.pvm as pvm, Tosite.sarja as sarja, "
+                           "Tosite.tunniste as tunniste, min(Vienti.pvm) as vientipvm, Kumppani.nimi AS Kumppani "
+                           "FROM Vienti "
+                           "JOIN Tosite ON vienti.tosite=Tosite.id "
+                           "LEFT OUTER JOIN Kumppani ON vienti.kumppani=Kumppani.id "
+                           "WHERE vienti.tili=%1 AND vienti.eraid < 0 AND vienti.pvm <= '%2' AND Tosite.tila >= 100 "
+                           "GROUP BY vienti.eraid, vienti.tili "
+                           "HAVING sum(vienti.debetsnt) <> sum(vienti.kreditsnt) OR sum(vienti.debetsnt) IS NULL OR sum(vienti.kreditsnt) IS NULL;"
+                           ).arg(tili->numero()).arg(mihin.toString(Qt::ISODate)));
+
+    while( apukysely.next()) {
+        QVariantMap era;
+        era.insert("id", apukysely.value(0).toInt());
+        era.insert("pvm", apukysely.value(4).toDate() );
+        era.insert("sarja", apukysely.value(5));
+        era.insert("tunniste", apukysely.value(6));
+        era.insert("vientipvm", apukysely.value(7).toDate());
+        era.insert("selite", apukysely.value(3));
+        era.insert("kumppani", apukysely.value("Kumppani"));
         Euro summa = Euro(tili->onko(TiliLaji::VASTAAVAA) ?
                     apukysely.value(1).toLongLong() - apukysely.value(2).toLongLong() :
                     apukysely.value(2).toLongLong() - apukysely.value(1).toLongLong() );
